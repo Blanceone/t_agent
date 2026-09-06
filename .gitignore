@@ -1,0 +1,41 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# Copied production logs / local dumps
+tmp_logs/
+**/tmp_logs*/
+
+# Runtime data
+**/data/account/
+**/data/memory/
+**/data/replay/
+**/data/logs/
+**/data/snapshots/
+**/data/reports/
+
+# Wiki runtime
+.wiki/.last-update.json
+.wiki/.opencode-*.json
+.wiki/.openchamber-*.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

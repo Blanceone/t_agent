@@ -1,0 +1,19 @@
+[Unit]
+Description=AI-T-Agent Main Process
+After=network.target chronyd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ai-t-agent
+Environment=PYTHONPATH=/opt/ai-t-agent/src
+EnvironmentFile=/opt/ai-t-agent/.env
+ExecStart=/opt/ai-t-agent/.venv/bin/python -m agent.main
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

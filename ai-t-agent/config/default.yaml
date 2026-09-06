@@ -1,0 +1,91 @@
+# AI-T-Agent 默认配置
+# 所有业务参数从此文件读取，禁止代码硬编码
+
+fee:
+  stamp_tax_rate: "0.0005"
+  transfer_fee_rate: "0.00001"
+  commission_rate: "0.00025"
+  min_commission: "5"
+
+risk:
+  stop_loss_ratio: "0.92"
+  enable_deep_stop_loss: false
+  deep_stop_loss_threshold: "0.98"
+  stop_breach_confirm_count: 2
+  day_loss_halt_ratio: "0.03"
+  realized_loss_halt_abs: "500"
+  max_drawdown_liquidate: "0.10"
+  reserved_min_cash_ratio: "0.20"
+  max_single_position_ratio: "0.50"
+  decision_confidence_threshold: 0.60
+  enforce_intraday_buy_limit: false
+
+trading:
+  initial_cash: "30000"
+  watchlist_limit: 20
+  max_liquidation_attempts: 30
+  max_liquidation_shares_per_tick: 10000
+  stale_quote_threshold_sec: 5
+
+scheduler:
+  tick_interval_sec: 60
+  day_start_time: "09:20"
+  session_am_start: "09:30"
+  session_am_end: "11:30"
+  session_pm_start: "13:00"
+  session_pm_end: "14:57"
+  day_close_time: "15:05"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key_env: "LLM_API_KEY"
+  base_url_env: "LLM_BASE_URL"
+  timeout_ms: 30000
+  max_retries: 1
+  temperature: 0.1
+  # V4 默认开思考，盘中 30s 超时必须关掉
+  extra_body:
+    thinking:
+      type: "disabled"
+
+prompt:
+  decision_version: "decision.v2.22"
+  reflection_version: "reflection.v1.0"
+  planner_version: "planner.v1.6"
+  market_understanding_version: "market_understanding.v1.1"
+
+memory:
+  memory_top_k: 8
+  memory_inject_max_tokens: 1500
+  memory_compress_after_days: 30
+  db_path: "data/memory/memory.db"
+
+market:
+  data_source: "tencent"
+  tushare_token_env: "TUSHARE_TOKEN"
+
+feature:
+  volume_ratio_lookback_days: 5
+  chg_pct_5d_lookback: 5
+  chg_pct_10d_lookback: 10
+  round_trip_est_shares: 100
+
+decision:
+  confidence_threshold: 0.60
+  max_decision_retries: 1
+  context_max_tokens: 4000
+  hold_on_failure: true
+
+replay:
+  retention_days: 90
+  compress_after_days: 30
+  save_tick_realtime: true
+  evaluation_benchmark: "equal_weight"
+
+reflection:
+  enable_llm_analysis: true
+  max_memory_candidates: 5
+
+log_level: "INFO"
+data_dir: "data"

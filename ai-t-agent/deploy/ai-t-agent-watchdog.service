@@ -1,0 +1,16 @@
+[Unit]
+Description=AI-T-Agent WatchDog
+After=ai-t-agent.service
+BindsTo=ai-t-agent.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ai-t-agent
+Environment=PYTHONPATH=/opt/ai-t-agent/src
+ExecStart=/opt/ai-t-agent/.venv/bin/python -m agent.watchdog.watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

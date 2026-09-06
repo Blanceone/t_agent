@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/account/
+data/memory/
+data/replay/
+data/logs/
+data/snapshots/
+data/reports/
+
+# Local log dumps
+tmp_logs*/
+*.log
+
+# Tests
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
