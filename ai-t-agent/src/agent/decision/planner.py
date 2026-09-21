@@ -28,7 +28,7 @@ logger = get_logger("planner")
 class StockPlan:
     """单票计划"""
     code: str
-    trade_plan: str = "高抛低吸"
+    trade_plan: str = ""
     target_position_ratio: float = 0.25
     t_strategy: str = "SELL_FIRST_THEN_BUY_BACK"  # SELL_FIRST_THEN_BUY_BACK / BUY_FIRST_THEN_SELL / WAIT
     risk_level: str = "MEDIUM"
@@ -140,7 +140,7 @@ class Planner:
         for code in watchlist:
             plans.append(StockPlan(
                 code=code,
-                trade_plan="保守做T，高抛低吸",
+                trade_plan="条件满足时交易，否则观望",
                 target_position_ratio=0.25,
                 t_strategy=constraints["default_strategy"],
                 risk_level=constraints["default_risk"],
@@ -207,8 +207,15 @@ class Planner:
                     f"现价{q.last}, 今开{q.open}, 日内均价{q.vwap}, 最高{q.high}, 最低{q.low}"
                 )
             elif q:
+                pb = (getattr(snapshot, "pending_buyback", None) or {}).get(code)
+                pending_note = ""
+                if pb is not None and getattr(pb, "shares", 0) > 0:
+                    pending_note = (
+                        f", 未接回{pb.shares}股, 卖出均价{pb.sell_avg}"
+                        f"（账户事实，不是买入上限，也不强制买回）"
+                    )
                 holdings_info.append(
-                    f"- {code}: 无持仓, 昨收{q.pre_close}{tech}；"
+                    f"- {code}: 无持仓{pending_note}, 昨收{q.pre_close}{tech}；"
                     f"竞价快照（尚未形成日内含义，勿当全日锚）: "
                     f"现价{q.last}, 今开{q.open}, 日内均价{q.vwap}, 最高{q.high}, 最低{q.low}"
                 )
@@ -252,14 +259,14 @@ class Planner:
 ## 相关记忆
 {memory_text if memory_text else "无"}
 
-## 计划编写规范（必须遵守）
-1. trade_plan 必须写成"当<状态条件>且<价格条件>时，执行<动作>"的条件式表述，禁止写无前提的触发式语句
-2. 买入分两类写清楚：①当前加仓（仅当持仓低于目标仓位比例）；②卖出后的接回（先卖后买时可以写，即使当前仓位高于目标）。不得把「现在立刻加仓」写进已超目标的计划
-3. 卖出条件必须包含持仓前提（如持有可卖仓位）；若无持仓，计划中不得包含卖出动作
-4. 价格条件写相对关系，不要写开盘快照上的绝对价区间（禁止把此刻现价/均价/最高/最低冻成全日成交门，例如「在a.aa-b.bb时卖出」）。可写较今开、较当时日内最高/最低/均价、较成本、较昨收、较MA/支撑/压力；方向与大致宽窄即可。不要写「卖在偏高一侧」这类无参照的定性句，也不指定必须使用均线。先卖后买时，卖出后的买入写「接回」不要写「建仓」。
+## 计划编写规范
+1. trade_plan 写成"当<状态条件>且<价格条件>时，执行<动作>"的条件式表述，不要写无前提的触发式语句
+2. 仓位相对目标是数据，不要写成必须立刻加仓或减仓。买入可以是接回、加仓或建仓，手数由分钟决策按购买力决定
+3. 卖出条件写明持仓前提（如持有可卖仓位）；若无持仓，计划中不要包含卖出动作。未接回是参考，不要写成必须买回或不得超过未接回
+4. 价格条件写相对关系，不要写开盘快照上的绝对价区间（不要把此刻现价/均价/最高/最低冻成全日成交门，例如「在a.aa-b.bb时卖出」）。可写较今开、较当时日内最高/最低/均价、较成本、较昨收、较MA/支撑/压力；方向与大致宽窄即可。不要写「卖在偏高一侧」这类无参照的定性句，也不指定必须使用均线。
 5. 每条计划需说明：目标仓位、今日最多交易笔数、买卖的相对条件、不满足条件时保持观望。不要输出 fen 级绝对触发价。
-6. "今日最多交易笔数"按"做T次数"计：一次做T = 卖出+买回，卖出后未接回的买回属于同一次做T，不占用新预算；接回不强制当日完成（当日无合适低位价格可等后续交易日），计划中不得要求"当日必须买回"。max_trades_hint 为整数，不得超过上方「最大做T次数」；输出示例中的数字不是默认值。先卖后买时每笔卖出占1次，分批卖出分别计入；接回不占。不要因此要求一次卖光或必须分批。
-7. trade_plan 的动作不要写死持仓/可卖/未接回的全部股数（禁止「卖出300股」「接回同等股数」「买入200股建仓」）。手数由分钟决策根据可卖/未接回/最多可买自定；可写「卖出不超过可卖」「接回不超过未接回」。
+6. "今日最多交易笔数"按"做T次数"计：一次做T = 卖出+买回，卖出后的买回不占用新预算；不强制当日买回。max_trades_hint 为整数，不得超过上方「最大做T次数」；输出示例中的数字不是默认值。先卖后买时每笔卖出占1次，分批卖出分别计入；买入不占。不要因此要求一次卖光或必须分批。WAIT或今日不安排做T时，不要把 max_trades_hint 写成 0 来锁死买卖；0 不等于次数已满。空仓时不要全日禁止买入。
+7. trade_plan 的动作不要写死持仓/可卖/未接回的全部股数（禁止「卖出300股」「买入200股建仓」）。手数由分钟决策根据可卖/最多可买自定；可写「卖出不超过可卖」。未接回不是买入上限。
 
 ## 输出格式（严格JSON）
 ```json

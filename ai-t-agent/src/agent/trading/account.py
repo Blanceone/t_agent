@@ -16,11 +16,14 @@ from typing import Dict, List, Optional
 
 from agent.common.models import (
     AccountSnapshot,
+    ActionType,
     BenchmarkPortfolio,
     Cash,
     EqualWeightBenchmark,
     CSI300Benchmark,
+    Fill,
     LiquidationTask,
+    PendingBuyback,
     Position,
     PositionState,
     Quote,
@@ -28,7 +31,7 @@ from agent.common.models import (
     WatchlistEntry,
 )
 from agent.common.logger import get_logger
-from agent.common.utils import now_cst
+from agent.common.utils import now_cst, today_str
 
 logger = get_logger("trading.account")
 
@@ -57,6 +60,8 @@ class Account:
         self.nav_open_date: str = ""
         self.realized_pnl_today: Decimal = Decimal("0")
         self.liquidation_queue: List[LiquidationTask] = []
+        self.pending_buyback: Dict[str, PendingBuyback] = {}
+        self.buyback_bought_today: Dict[str, int] = {}
         self.benchmark = BenchmarkPortfolio(
             equal_weight=EqualWeightBenchmark(
                 nav=initial_cash, constituents={}, last_rebuild_date=""
@@ -100,6 +105,8 @@ class Account:
             realized_pnl_today=self.realized_pnl_today,
             liquidation_queue=list(self.liquidation_queue),
             snapshot_time=now_cst(),
+            pending_buyback=dict(self.pending_buyback),
+            buyback_bought_today=dict(self.buyback_bought_today),
         )
 
     def add_to_watchlist(self, code: str, date: str) -> bool:
@@ -117,8 +124,53 @@ class Account:
         return True
 
     def reset_daily(self) -> None:
-        """日切重置（每日累计量）"""
+        """日切重置（每日累计量）。未接回跨日保留。"""
         self.realized_pnl_today = Decimal("0")
+        self.buyback_bought_today = {}
+
+    def apply_fill_to_pending(self, fill: Fill) -> None:
+        """按成交维护未接回：卖出增加，买入先冲减未接回。"""
+        code = fill.code
+        if fill.action == ActionType.SELL:
+            rec = self.pending_buyback.get(code)
+            if rec is None or rec.shares <= 0:
+                self.pending_buyback[code] = PendingBuyback(
+                    code=code,
+                    shares=int(fill.shares),
+                    sell_avg=fill.price,
+                    sell_date=today_str(),
+                )
+                return
+            total = rec.shares + int(fill.shares)
+            avg = (rec.sell_avg * rec.shares + fill.price * int(fill.shares)) / total
+            self.pending_buyback[code] = PendingBuyback(
+                code=code, shares=total, sell_avg=avg, sell_date=today_str(),
+            )
+            return
+        if fill.action != ActionType.BUY:
+            return
+        rec = self.pending_buyback.get(code)
+        if rec is None or rec.shares <= 0:
+            return
+        reduced = min(rec.shares, int(fill.shares))
+        if reduced > 0:
+            self.buyback_bought_today[code] = (
+                self.buyback_bought_today.get(code, 0) + reduced
+            )
+        left = rec.shares - int(fill.shares)
+        if left <= 0:
+            del self.pending_buyback[code]
+        else:
+            self.pending_buyback[code] = PendingBuyback(
+                code=code, shares=left, sell_avg=rec.sell_avg, sell_date=rec.sell_date,
+            )
+
+    def clear_pending(self, code: Optional[str] = None) -> None:
+        """清除未接回。code 为空则全部清除。"""
+        if code is None:
+            self.pending_buyback.clear()
+            return
+        self.pending_buyback.pop(code, None)
 
     def update_nav(self, quotes: Dict[str, Quote], date: str) -> None:
         """日终更新 NAV"""
@@ -222,6 +274,19 @@ class Account:
             "nav_open_date": self.nav_open_date,
             "realized_pnl_today": str(self.realized_pnl_today),
             "liquidation_queue": liq_queue,
+            "pending_buyback": {
+                code: {
+                    "code": rec.code,
+                    "shares": rec.shares,
+                    "sell_avg": str(rec.sell_avg),
+                    "sell_date": rec.sell_date,
+                }
+                for code, rec in self.pending_buyback.items()
+                if rec.shares > 0
+            },
+            "buyback_bought_today": {
+                code: n for code, n in self.buyback_bought_today.items() if n > 0
+            },
             "benchmark": {
                 "equal_weight": {
                     "nav": str(self.benchmark.equal_weight.nav),
@@ -285,6 +350,27 @@ class Account:
                 attempts=task_data["attempts"],
                 created_at=task_data.get("created_at", ""),
             ))
+
+        self.pending_buyback = {}
+        for code, rec in data.get("pending_buyback", {}).items():
+            shares = int(rec.get("shares", 0) or 0)
+            if shares <= 0:
+                continue
+            self.pending_buyback[code] = PendingBuyback(
+                code=str(rec.get("code", code)),
+                shares=shares,
+                sell_avg=Decimal(str(rec.get("sell_avg", "0"))),
+                sell_date=str(rec.get("sell_date", "")),
+            )
+
+        self.buyback_bought_today = {}
+        for code, n in data.get("buyback_bought_today", {}).items():
+            try:
+                shares = int(n or 0)
+            except (TypeError, ValueError):
+                shares = 0
+            if shares > 0:
+                self.buyback_bought_today[str(code)] = shares
 
         bm = data.get("benchmark", {})
         ew = bm.get("equal_weight", {})

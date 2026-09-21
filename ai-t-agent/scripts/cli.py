@@ -72,6 +72,7 @@ def cmd_remove(code: str):
         notify_service(engine)
         print(f"已触发清仓: {code}（清仓完成后移出池）")
     elif engine.account.remove_from_watchlist(code):
+        engine.account.clear_pending(code)
         engine.account.save()
         notify_service(engine)
         print(f"已移除: {code}（常驻服务将在下个 Tick/日切时生效）")
@@ -119,6 +120,7 @@ def cmd_clear_all():
     engine, _ = get_engine()
     for code in list(engine.account.positions.keys()):
         engine.enqueue_liquidation(code, "USER_REMOVE")
+    engine.account.clear_pending()
     engine.account.save()
     notify_service(engine)
     print("已触发全部清仓（常驻服务将在下个 Tick/日切时生效）")

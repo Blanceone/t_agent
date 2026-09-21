@@ -227,6 +227,15 @@ class Cash:
     reserved_min_ratio: Decimal = Decimal("0.20")
 
 
+@dataclass(frozen=True)
+class PendingBuyback:
+    """未接回（含跨日）：卖出尚未买回的股数与卖出均价。"""
+    code: str
+    shares: int
+    sell_avg: Decimal
+    sell_date: str = ""
+
+
 @dataclass
 class AccountSnapshot:
     """账户不可变快照（Tick 内使用）"""
@@ -240,6 +249,8 @@ class AccountSnapshot:
     realized_pnl_today: Decimal
     liquidation_queue: List["LiquidationTask"]
     snapshot_time: datetime
+    pending_buyback: Dict[str, PendingBuyback] = field(default_factory=dict)
+    buyback_bought_today: Dict[str, int] = field(default_factory=dict)
 
 
 # ==================== 订单与成交 ====================
@@ -333,6 +344,7 @@ class DecisionOutput:
     prompt_render_hash: str = ""
     context_id: str = ""
     timestamp: str = ""
+    minute_conclusion: str = ""  # 本分钟一句话结论，供下一分钟注入
 
 
 # ==================== 风控 ====================

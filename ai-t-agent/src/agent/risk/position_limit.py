@@ -3,7 +3,7 @@
 
 规则：
 - 20% 现金预留：available_cash - (预买金额 + 预估费用) >= nav_mark * 20%
-- 单票上限：mark_price * (total_shares + new_shares) <= nav_mark * 50%
+- 单票上限：mark_price * (total_shares + new_shares) <= nav_mark * 配置比例（默认 100%，由现金预留先卡住）
 - 冷却期：cooldown_until_date >= 当前日期 → 禁止 BUY
 - 换仓亏损联动拒绝：同分钟亏损SELL后的跨标的BUY拒绝
 """

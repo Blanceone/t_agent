@@ -16,7 +16,7 @@ risk:
   realized_loss_halt_abs: "500"
   max_drawdown_liquidate: "0.10"
   reserved_min_cash_ratio: "0.20"
-  max_single_position_ratio: "0.50"
+  max_single_position_ratio: "1.00"
   decision_confidence_threshold: 0.60
   enforce_intraday_buy_limit: false
 
@@ -50,9 +50,9 @@ llm:
       type: "disabled"
 
 prompt:
-  decision_version: "decision.v2.22"
+  decision_version: "decision.v2.30"
   reflection_version: "reflection.v1.0"
-  planner_version: "planner.v1.6"
+  planner_version: "planner.v1.9"
   market_understanding_version: "market_understanding.v1.1"
 
 memory:

@@ -28,7 +28,7 @@ class RiskConfig(BaseModel):
     realized_loss_halt_abs: Decimal = Decimal("500")
     max_drawdown_liquidate: Decimal = Decimal("0.10")
     reserved_min_cash_ratio: Decimal = Decimal("0.20")
-    max_single_position_ratio: Decimal = Decimal("0.50")
+    max_single_position_ratio: Decimal = Decimal("1.00")
     decision_confidence_threshold: float = 0.60
     enforce_intraday_buy_limit: bool = False
 
@@ -67,9 +67,9 @@ class LLMConfig(BaseModel):
 
 class PromptConfig(BaseModel):
     """Prompt 版本"""
-    decision_version: str = "decision.v2.22"
+    decision_version: str = "decision.v2.30"
     reflection_version: str = "reflection.v1.0"
-    planner_version: str = "planner.v1.6"
+    planner_version: str = "planner.v1.9"
     market_understanding_version: str = "market_understanding.v1.1"
 
 

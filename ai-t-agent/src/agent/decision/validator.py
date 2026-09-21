@@ -18,6 +18,15 @@ from agent.common.logger import get_logger
 logger = get_logger("decision.validator")
 
 VALID_RISK_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+CONCLUSION_MAX_CHARS = 80
+
+
+def clip_conclusion(text) -> str:
+    """一句话结论：压空白、截断。缺省为空串，不因此校验失败。"""
+    t = " ".join(str(text or "").split())
+    if len(t) > CONCLUSION_MAX_CHARS:
+        return t[:CONCLUSION_MAX_CHARS].rstrip() + "…"
+    return t
 
 
 class DecisionValidator:
@@ -51,6 +60,7 @@ class DecisionValidator:
             schema_version="decision.v1",
             prompt_version=prompt_version,
             context_id=context_id,
+            minute_conclusion=clip_conclusion(raw.get("minute_conclusion", "")),
         )
 
     def _validate_item(self, d: dict) -> Optional[DecisionItem]:

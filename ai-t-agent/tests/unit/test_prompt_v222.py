@@ -18,10 +18,10 @@ from tests.unit.test_prompt_v213 import (
 
 MUST_SELL = ("必须卖", "当前可执行步骤：卖出", "若本分钟交易，只允许SELL")
 LOT_FREE = (
-    "可以小于可卖或未接回全部",
+    "可以小于可卖全部",
     "也可以等于全部可卖",
     "不是必须一次做完的手数",
-    "不必等于可卖全部或未接回全部",
+    "不必等于可卖全部",
 )
 NEG_PENDING = ("未接回-", "未接回−")
 
@@ -167,9 +167,10 @@ class TestScenarioMatrix:
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
         assert "持仓0股" in hold and "未接回300股" in hold
-        assert "今日卖出均价16.27" in hold
-        assert "买入是接回该笔做T，不是建仓" in hard
-        assert "接回买入（未接回300股）" in plan
+        assert "卖出均价16.27" in hold
+        assert "买入是接回该笔做T，不是建仓" not in hard
+        assert "可买或观望" in plan and "未接回300股" in plan
+        assert "接回买入（未接回300股）" not in plan
         assert "## 持仓\n无持仓" not in prompt
         for kw in OPEN_JIANCANG:
             assert kw not in _role(prompt)
@@ -191,7 +192,7 @@ class TestScenarioMatrix:
         hold = _sec(prompt, "持仓")
         plan = _sec(prompt, "今日计划")
         hard = _sec(prompt, "硬性约束")
-        assert "接回已闭环" in hold
+        assert "今日已卖300股/已买300股" in hold
         assert "未接回" not in hold
         assert "HOLD（做T次数已满）" in plan or "HOLD（T+1不可卖）" in plan
         assert "买入是接回该笔做T，不是建仓" not in hard
@@ -212,7 +213,7 @@ class TestScenarioMatrix:
         )
         hold = _sec(prompt, "持仓")
         hard = _sec(prompt, "硬性约束")
-        assert "今日已买100股（今日无卖出，不是接回）" in hold
+        assert "今日已买100股" in hold
         assert "未接回" not in hold
         assert "买入是接回该笔做T，不是建仓" not in hard
         _invariants(prompt)
@@ -227,7 +228,8 @@ class TestScenarioMatrix:
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
         assert hold.strip() == "## 持仓\n无持仓"
-        assert "仅可执行计划中的买入建仓部分" in hard
+        assert "无持仓，无股可卖，禁止发出SELL" in hard
+        assert "仅可执行计划中的买入建仓部分" not in hard
         assert "买入建仓或观望（无持仓）" in plan
         assert "买入是接回该笔做T，不是建仓" not in hard
         assert "未接回" not in hold
@@ -265,10 +267,11 @@ class TestScenarioMatrix:
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
         assert "002185" in hold and "未接回300股" in hold
-        assert "买入是接回该笔做T，不是建仓" in hard
+        assert "买入是接回该笔做T，不是建仓" not in hard
         assert "601918 无持仓" in hard
         assert "601918" in plan and "买入建仓或观望（无持仓）" in plan
-        assert "002185" in plan and "接回买入（未接回300股）" in plan
+        assert "002185" in plan and "可买或观望" in plan
+        assert "接回买入（未接回300股）" not in plan
         assert "每笔SELL占1次" in plan
         # 空仓票不得吃到接回句；清仓票不得吃到建仓句
         lines_185 = [ln for ln in (hard + plan).splitlines() if "002185" in ln]
@@ -330,7 +333,9 @@ class TestBudgetIsolation:
         plan = _sec(prompt, "今日计划")
         hard = _sec(prompt, "硬性约束")
         assert "今日已做T 1次/上限1次" in plan
-        assert "仅允许接回BUY" in hard
+        assert "仍可BUY" in hard
+        assert "仅允许接回BUY" not in hard
+        assert "完成本次做T" not in hard
         assert "未接回100股" in _sec(prompt, "持仓")
         # 次数用尽仍允许接回，不要求把剩余可卖再卖掉
         assert "必须卖" not in prompt

@@ -23,7 +23,7 @@ from agent.common.logger import get_logger
 from agent.common.utils import now_cst
 from agent.llm.client import LLMClient, SingleFlightGuard
 from agent.config.schema import AppConfig
-from agent.decision.validator import DecisionValidator
+from agent.decision.validator import DecisionValidator, clip_conclusion
 from agent.trading.fee import FeeCalculator
 
 logger = get_logger("decision.engine")
@@ -37,6 +37,27 @@ def _pct_yuan(last: Decimal, ref, label: str) -> Optional[str]:
     if ref <= 0:
         return None
     return f"较{label}{(last - ref) / ref * 100:+.1f}%（{last - ref:+.2f}元）"
+
+
+def _buyback_spread_note(
+    last: Decimal, sell_avg: Decimal, fee_per_share: Optional[Decimal] = None,
+) -> str:
+    """接回价差 = 卖出均价 − 现价。数据，不是必须或禁止接回。"""
+    spread = sell_avg - last
+    if last > sell_avg:
+        side = "买在卖出价上方"
+    elif last < sell_avg:
+        side = "买在卖出价下方"
+    else:
+        side = "现价等于卖出均价"
+    note = (
+        f"若按现价接回：卖出均价{sell_avg:.2f}-现价{last:.2f}"
+        f"={spread:+.2f}元/股（{side}）"
+    )
+    if fee_per_share is not None and fee_per_share > 0:
+        after = spread - fee_per_share
+        note += f"，扣往返费用后约{after:+.2f}元/股"
+    return note
 
 
 def _buy_unavailable_reason(cash_shares: int, cap_shares: int) -> str:
@@ -65,16 +86,54 @@ def _hm_minutes(hhmm: str) -> int:
     return hour * 60 + minute
 
 
-def _intraday_lot_note(sold: int, bought: int) -> str:
-    """今日买卖手数事实。未接回只在已卖>已买时为正数，不打印 0 或负数。"""
-    if not sold and not bought:
+def _intraday_lot_note(
+    sold: int, bought: int, pending: int = 0, buyback_today: int = 0,
+) -> str:
+    """今日买卖手数。未接回只写正数。不做闭环/是否接回判定。"""
+    parts = []
+    if sold and bought:
+        parts.append(f"今日已卖{sold}股/已买{bought}股")
+    elif sold:
+        parts.append(f"今日已卖{sold}股")
+    elif bought:
+        parts.append(f"今日已买{bought}股")
+    if pending > 0:
+        parts.append(f"未接回{pending}股")
+    if not parts:
         return ""
-    if sold > bought:
-        return f", 今日已卖{sold}股/已买{bought}股/未接回{sold - bought}股"
-    if sold > 0:
-        extra = f"，净买入{bought - sold}股" if bought > sold else ""
-        return f", 今日已卖{sold}股/已买{bought}股，接回已闭环{extra}"
-    return f", 今日已买{bought}股（今日无卖出，不是接回）"
+    return ", " + "，".join(parts)
+
+
+def _budget_exhausted(plan, t_used: int) -> bool:
+    """上限>0 且已用完才算次数用尽。上限 0 不是已满。"""
+    if plan is None:
+        return False
+    cap = int(getattr(plan, "max_trades_hint", 0) or 0)
+    return cap > 0 and t_used >= cap
+
+
+def _pending_of(snapshot: AccountSnapshot, code: str, sold: int, bought: int) -> int:
+    recs = getattr(snapshot, "pending_buyback", None) or {}
+    rec = recs.get(code)
+    if rec is not None:
+        return max(0, int(getattr(rec, "shares", 0) or 0))
+    return max(0, sold - bought)
+
+
+def _buyback_today_of(snapshot: AccountSnapshot, code: str) -> int:
+    recs = getattr(snapshot, "buyback_bought_today", None) or {}
+    try:
+        return max(0, int(recs.get(code, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pending_avg_of(snapshot: AccountSnapshot, code: str, sell_avg_by_code: Dict[str, Decimal]):
+    recs = getattr(snapshot, "pending_buyback", None) or {}
+    rec = recs.get(code)
+    if rec is not None and getattr(rec, "sell_avg", None) is not None:
+        return rec.sell_avg
+    return sell_avg_by_code.get(code)
 
 
 def _session_elapsed_minutes(now, am_start: str, am_end: str, pm_start: str) -> int:
@@ -114,6 +173,8 @@ class DecisionEngine:
         self._yesterday_summary: str = ""
         # 反馈闭环：最近被风控拒绝的决策（跨分钟记忆）
         self._recent_feedback: deque = deque(maxlen=6)
+        # 当日分钟结论（模型一句话，供下一分钟连贯；日切清空）
+        self._today_conclusions: deque = deque(maxlen=30)
         # 可观测性：最近一次的 Prompt 与 LLM 原始响应（供 Replay 落盘）
         self._last_prompt: str = ""
         self._last_raw: Optional[dict] = None
@@ -131,6 +192,7 @@ class DecisionEngine:
         self._regime = regime
         self._market_summary = market_summary
         self._yesterday_summary = yesterday_summary
+        self._today_conclusions.clear()
         if not watchlist:
             self._recent_feedback.clear()
 
@@ -138,6 +200,27 @@ class DecisionEngine:
         """记录风控拒绝反馈（由 TickExecutor 在拒单时调用），供后续 Prompt 注入"""
         ts = now_cst().strftime("%H:%M")
         self._recent_feedback.append(f"[{ts}] {feedback}")
+
+    def _remember_conclusion(self, decision: DecisionOutput) -> None:
+        """把本分钟一句话结论追加到当日历史，供下一分钟 Prompt。"""
+        ts = now_cst().strftime("%H:%M")
+        primary = decision.decisions[0] if decision.decisions else None
+        action = primary.action.value if primary else "HOLD"
+        code = primary.code if primary else ""
+        text = clip_conclusion(decision.minute_conclusion)
+        if not text and primary:
+            text = clip_conclusion(primary.reason)
+        if not text:
+            return
+        bit = f"{ts} {action}"
+        if code:
+            bit += f" {code}"
+        self._today_conclusions.append(f"{bit}：{text}")
+
+    def _prior_conclusions_text(self) -> str:
+        if not self._today_conclusions:
+            return "无（开盘后尚未记录）"
+        return chr(10).join(f"- {line}" for line in self._today_conclusions)
 
 
     def t_status(self, code: str) -> str:
@@ -172,9 +255,17 @@ class DecisionEngine:
             or getattr(plan, "max_trades_hint", 0)
             or 0
         )
+        pending = sell_sh - buy_sh
+        if trading is not None:
+            acc = getattr(trading, "account", None)
+            if acc is not None:
+                recs = getattr(acc, "pending_buyback", None) or {}
+                rec = recs.get(code)
+                if rec is not None:
+                    pending = int(getattr(rec, "shares", 0) or 0)
         if cap <= 0 or used < cap:
             return "open"
-        if sell_sh - buy_sh > 0:
+        if pending > 0:
             return "buyback_only"
         return "hold_only"
 
@@ -220,6 +311,7 @@ class DecisionEngine:
                 context_id=f"ctx_{tick_id}",
             )
             if decision:
+                self._remember_conclusion(decision)
                 self._audit_log(decision, tick_id)
             return decision
 
@@ -246,6 +338,7 @@ class DecisionEngine:
                 "timestamp": now_cst().isoformat(),
                 "tick_id": tick_id,
                 "thought": decision.thought_process[:200],
+                "minute_conclusion": decision.minute_conclusion,
                 "decisions": [
                     {"action": d.action.value, "code": d.code, "shares": d.shares,
                      "confidence": d.confidence, "reason": d.reason[:120]}
@@ -346,7 +439,10 @@ class DecisionEngine:
                     target_note = f"（目标{_pp.target_position_ratio * 100:.1f}%）"
                 sold = sells_by_code.get(code, 0)
                 bought = buys_by_code.get(code, 0)
-                lot_note = _intraday_lot_note(sold, bought)
+                pending_here = _pending_of(snapshot, code, sold, bought)
+                lot_note = _intraday_lot_note(
+                    sold, bought, pending_here, _buyback_today_of(snapshot, code),
+                )
                 holdings_info.append(
                     f"- {code}: 持仓{pos.total_shares}股, 可卖{pos.sellable_shares}股{sell_note}, "
                     f"成本{pos.cost_price}, 现价{q.last}, "
@@ -355,26 +451,26 @@ class DecisionEngine:
                     f"风控线{pos.stop_loss_price}(现价距风控线{stop_gap:+.2f}%)"
                 )
 
-        # 清仓后持仓区仍要写未接回，否则模型会把接回当成建仓（8/28 10:10）
+        # 清仓后持仓区仍要写未接回（含跨日），避免当成从未持有
         for code in self._watchlist:
             if code in snapshot.positions:
                 continue
             sold = sells_by_code.get(code, 0)
             bought = buys_by_code.get(code, 0)
-            pending = sold - bought
+            pending = _pending_of(snapshot, code, sold, bought)
             if pending <= 0:
                 continue
             q = quotes.get(code)
             extra = ""
-            avg = sell_avg_by_code.get(code)
+            avg = _pending_avg_of(snapshot, code, sell_avg_by_code)
             if avg is not None and q is not None:
                 extra = (
-                    f", 今日卖出均价{avg:.2f}, 现价{q.last}"
+                    f", 卖出均价{avg:.2f}, 现价{q.last}"
                     f"（较卖出均价{q.last - avg:+.2f}元）"
                 )
             holdings_info.append(
-                f"- {code}: 持仓0股, 可卖0股（今日卖出未接回，禁止发出SELL）"
-                f"{_intraday_lot_note(sold, bought)}{extra}"
+                f"- {code}: 持仓0股, 可卖0股（卖出未接回，禁止发出SELL）"
+                f"{_intraday_lot_note(sold, bought, pending, _buyback_today_of(snapshot, code))}{extra}"
             )
 
         # 购买力计算（与 Risk Engine 现金预留/单票上限规则一致）
@@ -406,7 +502,15 @@ class DecisionEngine:
             held = code in snapshot.positions
             chg = f"{(q.last - q.pre_close) / q.pre_close * 100:.2f}%" if q.pre_close > 0 else "0%"
 
-            # 可买上限 = min(现金约束, 单票仓位上限)，向下取整到 100 股
+            pos = snapshot.positions.get(code)
+            p = plan_by_code.get(code)
+            t_used = self._t_budget_used(p, code, fills_by_code, sell_fills_by_code)
+            pending_buyback = _pending_of(
+                snapshot, code,
+                sells_by_code.get(code, 0), buys_by_code.get(code, 0),
+            )
+
+            # 可买上限 = min(现金约束, 单票仓位上限)；未接回不是手数天花板
             price = q.ask1 or q.last
             cash_limit = 0
             cap_limit = 0
@@ -418,11 +522,7 @@ class DecisionEngine:
                 max_buyable = max(0, min(cash_limit, cap_limit)) // 100 * 100
             max_buyable_by_code[code] = max_buyable
 
-            pos = snapshot.positions.get(code)
-            p = plan_by_code.get(code)
-            t_used = self._t_budget_used(p, code, fills_by_code, sell_fills_by_code)
-            pending_buyback = sells_by_code.get(code, 0) - buys_by_code.get(code, 0)
-            budget_done = bool(p and t_used >= p.max_trades_hint)
+            budget_done = _budget_exhausted(p, t_used)
             hold_only = budget_done and pending_buyback <= 0
             buyback_only = budget_done and pending_buyback > 0
             risk_halt = risk_state.value == "HALT"
@@ -434,20 +534,16 @@ class DecisionEngine:
             elif risk_halt:
                 buy_hint = "禁止发出BUY（风控限制交易）"
             elif buyback_only:
-                buy_hint = f"仅允许接回BUY（尚有{pending_buyback}股未接回）"
-            elif pending_buyback > 0 and not held and max_buyable > 0:
-                buy_hint = (
-                    f"最多可买{max_buyable}股（今日未接回{pending_buyback}股，买入是接回不是建仓）"
-                )
+                if max_buyable > 0:
+                    buy_hint = f"最多可买{max_buyable}股（次数已用尽，禁止再卖）"
+                else:
+                    buy_hint = _buy_unavailable_reason(cash_limit, cap_limit)
             elif max_buyable > 0:
                 buy_hint = f"最多可买{max_buyable}股（超过此数量发出BUY将被拒绝）"
             else:
                 buy_hint = _buy_unavailable_reason(cash_limit, cap_limit)
             if not held:
-                if pending_buyback > 0:
-                    sell_hint = ", 禁止发出SELL（持仓0股，今日未接回中）"
-                else:
-                    sell_hint = ", 禁止发出SELL（无持仓，无股可卖）"
+                sell_hint = ", 禁止发出SELL（无持仓，无股可卖）"
             elif pos.sellable_shares <= 0:
                 sell_hint = ", 禁止发出SELL（T+1锁定）"
             elif hold_only:
@@ -457,22 +553,7 @@ class DecisionEngine:
 
             # 硬约束：卖/买/HOLD 互斥，不叠互相打架的通行证
             if not held:
-                if pending_buyback > 0:
-                    hard_constraints.append(
-                        f"{code} 持仓0股（今日卖出未接回），无股可卖，禁止发出SELL"
-                    )
-                    hard_constraints.append(
-                        f"{code} 今日已卖{sells_by_code.get(code, 0)}股、"
-                        f"未接回{pending_buyback}股：买入是接回该笔做T，不是建仓；"
-                        f"计划中的卖出步骤不可执行（无股可卖）；"
-                        f"是否接回由你根据数据判断，不强制当日"
-                    )
-                else:
-                    hard_constraints.append(f"{code} 无持仓，无股可卖，禁止发出SELL")
-                    if p and p.t_strategy == "SELL_FIRST_THEN_BUY_BACK":
-                        hard_constraints.append(
-                            f"{code} 无持仓：计划中的卖出步骤不可执行（无股可卖），"
-                            f"仅可执行计划中的买入建仓部分，或不满足买入条件时观望")
+                hard_constraints.append(f"{code} 无持仓，无股可卖，禁止发出SELL")
             elif pos.sellable_shares <= 0:
                 hard_constraints.append(
                     f"{code} 持仓{pos.total_shares}股但可卖为0（T+1锁定）："
@@ -486,9 +567,8 @@ class DecisionEngine:
                     f"停止交易只可HOLD")
             elif buyback_only:
                 hard_constraints.append(
-                    f"{code} 今日做T预算已用完，但尚有{pending_buyback}股卖出未接回："
-                    f"仅允许接回BUY完成本次做T（不强制今日接回），"
-                    f"禁止发出SELL和新建仓BUY")
+                    f"{code} 今日做T次数已用尽（已用{t_used}次/上限{p.max_trades_hint}次）："
+                    f"禁止发出SELL；仍可BUY（受最多可买约束）")
             elif max_buyable <= 0:
                 hard_constraints.append(
                     f"{code} {_buy_unavailable_reason(cash_limit, cap_limit)}")
@@ -565,19 +645,27 @@ class DecisionEngine:
             avg_vol = (t or {}).get("avg_volume_5d") if t else None
             if avg_vol and avg_vol > 0 and q.volume > 0:
                 calc_parts.append(f"量比{q.volume / avg_vol:.2f}")
-            avg_sell = sell_avg_by_code.get(code)
-            pending_here = sells_by_code.get(code, 0) - buys_by_code.get(code, 0)
-            if pending_here > 0 and avg_sell is not None:
-                vs_sell = _pct_yuan(q.last, avg_sell, "今日卖出均价")
-                if vs_sell:
-                    calc_parts.append(vs_sell)
+            avg_sell = _pending_avg_of(snapshot, code, sell_avg_by_code)
+            pending_here = _pending_of(
+                snapshot, code,
+                sells_by_code.get(code, 0), buys_by_code.get(code, 0),
+            )
             px = q.ask1 or q.last
             lot = self._config.feature.round_trip_est_shares
+            per: Optional[Decimal] = None
             if px and px > 0 and lot > 0:
                 fee_rt = self._fee_calc.round_trip_fee_est(px, lot)
                 per = fee_rt / Decimal(lot)
+            if pending_here > 0 and avg_sell is not None:
+                vs_sell = _pct_yuan(q.last, avg_sell, "卖出均价")
+                if vs_sell:
+                    calc_parts.append(vs_sell)
                 calc_parts.append(
-                    f"{lot}股往返费用约{fee_rt:.2f}元（约{per:.2f}元/股打平）")
+                    _buyback_spread_note(q.last, avg_sell, per)
+                )
+            if per is not None:
+                calc_parts.append(
+                    f"{lot}股往返费用约{fee_rt:.2f}元（约{per:.2f}元/股）")
             calc_note = ", 预计算: " + ", ".join(calc_parts) if calc_parts else ""
 
             ba_bits = []
@@ -652,14 +740,20 @@ class DecisionEngine:
                 t_used = self._t_budget_used(p, p.code, fills_by_code, sell_fills_by_code)
                 remaining = max(0, p.max_trades_hint - t_used)
                 pos = snapshot.positions.get(p.code)
-                pending = sells_by_code.get(p.code, 0) - buys_by_code.get(p.code, 0)
-                if p and t_used >= p.max_trades_hint and pending <= 0:
+                pending = _pending_of(
+                    snapshot, p.code,
+                    sells_by_code.get(p.code, 0), buys_by_code.get(p.code, 0),
+                )
+                if _budget_exhausted(p, t_used) and pending <= 0:
                     exec_now = "HOLD（做T次数已满）"
-                elif p and t_used >= p.max_trades_hint and pending > 0:
-                    exec_now = f"接回买入（未接回{pending}股）"
+                elif _budget_exhausted(p, t_used) and pending > 0:
+                    exec_now = f"可买或观望（次数已满，禁止再卖）；未接回{pending}股"
+                    mb = max_buyable_by_code.get(p.code, 0)
+                    if mb > 0:
+                        exec_now += f"；最多可买{mb}股"
                 elif pos is None:
                     if pending > 0:
-                        exec_now = f"接回买入（未接回{pending}股）或观望；不是建仓"
+                        exec_now = f"可买或观望；无股可卖；未接回{pending}股"
                         mb = max_buyable_by_code.get(p.code, 0)
                         if mb > 0:
                             exec_now += f"；最多可买{mb}股"
@@ -726,6 +820,7 @@ class DecisionEngine:
 
         # 今日已成交与风控反馈
         fills_text = chr(10).join(today_fills) if today_fills else "今日暂无成交"
+        prior_text = self._prior_conclusions_text()
         feedback_text = chr(10).join(self._recent_feedback) if self._recent_feedback \
             else "无（注意：被拒绝的指令不要重复提交）"
 
@@ -750,10 +845,11 @@ class DecisionEngine:
         power_text = f"{power_shown:.2f}（已扣现金预留{reserved_pct:.0f}%及最低佣金）"
 
         prompt = f"""你是一个A股日内交易决策引擎。根据当前账户状态、行情和今日计划，输出交易决策。
-你每分钟被调用一次。买入按卖一成交、卖出按买一成交。跨分钟记忆见下方"今日已成交"和"风控反馈"；不要重复提交已被拒绝的指令。同一标的可以跨分钟分批买卖。
-本次股数由本分钟决定，可以小于可卖或未接回全部，也可以等于全部可卖；计划里写的股数不是必须一次做完的手数。
+你每分钟被调用一次。买入按卖一成交、卖出按买一成交。跨分钟记忆见下方"今日已成交"、"今日先前结论"和"风控反馈"；不要重复提交已被拒绝的指令。同一标的可以跨分钟分批买卖。
+本次股数由本分钟决定，可以小于可卖全部，也可以等于全部可卖；买入可以超过未接回。计划里写的股数不是必须一次做完的手数。
 今日计划是开盘时的框架与偏好（方向、预算、相对条件），不是本分钟必须命中的绝对成交价。本分钟根据下方当前行情与预计算判断；计划里若出现绝对价，以本分钟数据为准，不要把「现价高于/低于计划价」当成禁止买卖的条件。
-未接回仅在今日已卖多于已买时出现且为正数。持仓区写有未接回股数时，买入是接回该笔做T，不是建仓。无未接回时买入不是接回（已持仓为加仓，空仓为建仓）。仓位比例相对目标、日内区间位置是数据，不是减仓或卖出的硬指令；区间位置须同时看连续竞价已过分钟与最高/最低出现时刻。
+「今日已成交」只记录当天买卖。未接回是账户事实（曾卖出尚未买回的股数和均价），不是买入上限，也不强制买回。做T次数上限为0不是次数已满。仓位比例相对目标、日内区间位置是数据，不是减仓或卖出的硬指令；现价接回价差是数据，不是接回时机的硬指令；区间位置须同时看连续竞价已过分钟与最高/最低出现时刻。
+开始本分钟推理前，先读「今日已成交」和「今日先前结论」，对照自己已经写下的判断，再结合本分钟数据。先前结论要认真对待，不是必须执行的硬指令；所依据的事实明显变化时可以改变结论，事实未变时不要无故推翻。
 
 ## 硬性约束（最高优先级，逐条检查后再决策，违反将被立即拒绝）
 {constraints_text}
@@ -775,8 +871,11 @@ class DecisionEngine:
 ## 持仓
 {chr(10).join(holdings_info) if holdings_info else "无持仓"}
 
-## 今日已成交（你的历史操作，不要重复）
+## 今日已成交（推理前先看；当天买卖记录，不要重复）
 {fills_text}
+
+## 今日先前结论（推理前先读；认真对照上一分钟自己写的判断。不是硬指令；事实未变时不要无故推翻，事实已变时可以改变结论）
+{prior_text}
 
 ## 最近风控反馈（这些指令已被拒绝，不要重复提交）
 {feedback_text}
@@ -794,24 +893,25 @@ class DecisionEngine:
 {memory_text if memory_text else "无"}
 
 ## 规则
-1. 已持仓的股票：做T（高抛低吸）或继续持有
-2. 股票池中未持仓且今日无未接回的股票：允许买入建立底仓（目标仓位参考今日计划的目标仓位比例，首次建仓不超过净值的25%）。未持仓但持仓区写有未接回股数时，买入是接回该笔做T，不是建仓
-3. 加仓：已持仓且低于目标仓位比例时允许买入，累计不超过目标仓位比例。接回（买入今日已卖出但尚未买回的股份）不是加仓：仓位高于目标时仍允许接回，但不得超过未接回股数，且仍受可买手数/现金/单票上限约束。无未接回时买入不是接回
-4. 买入必须100股整数倍，且不得超过该标的标注的买入容量/最多可买股数；标注"禁止发出BUY"的标的不得输出BUY。标注"禁止加仓BUY"只禁止加仓，不等于禁止接回：卖出后的接回仍允许（受未接回股数与最多可买约束）
+1. 已持仓的股票：可以买卖或继续持有
+2. 股票池中未持仓的股票：允许买入（受现金预留、最多可买约束）。无股可卖时禁止发出SELL
+3. 加仓受现金预留、最多可买约束；仓位相对目标是数据，不是必须加减仓。未接回不是买入上限，也不强制买回
+4. 买入必须100股整数倍，且不得超过该标的标注的买入容量/最多可买股数；标注"禁止发出BUY"的标的不得输出BUY。标注"禁止加仓BUY"只禁止加仓，不等于禁止买入
 5. 当日涨幅、距压力位、仓位相对目标、日内区间位置见行情预计算（数据，非禁令，也不是减仓指令）
-6. 卖出前提：持仓区该标的可卖数量>0。持仓0股的未接回行不能SELL。标注"T+1锁定，禁止发出SELL"或"禁止发出SELL（无持仓/持仓0股）"的标的不得输出SELL；已清仓当天不得再输出SELL。清仓后若持仓区仍有未接回，买入是接回不是建仓；无未接回才是建仓
-7. 卖出数量必须为100股整数倍，或等于全部可卖数量（一次性清仓允许零股）；卖出不得超过可卖数量。本次股数不必等于可卖全部或未接回全部
+6. 卖出前提：持仓区该标的可卖数量>0。持仓0股不能SELL。标注"T+1锁定，禁止发出SELL"或"禁止发出SELL（无持仓/持仓0股）"的标的不得输出SELL；已清仓当天不得再输出SELL
+7. 卖出数量必须为100股整数倍，或等于全部可卖数量（一次性清仓允许零股）；卖出不得超过可卖数量。本次股数不必等于可卖全部
 8. 同一标的同一分钟只能输出一个方向（BUY或SELL或HOLD），禁止同时输出BUY和SELL（立即执行下等于白付手续费；代码会只保留可执行的一条）
-9. 每只票当日做T次数见今日计划该标的一行；次数用尽后的限制见置顶硬约束
-10. 做T：一次做T=卖出+买回（高抛低吸）。同一分钟只能选一个方向。卖出后未接回股数见持仓区（仅已卖>已买时写未接回；已闭环写接回已闭环；今日无卖出的买入不是接回。持仓0股且有未接回时仍会写未接回，不要当成从未持仓的建仓）；是否接回、何时接回由你根据当前数据判断，不强制当日接回；接回不占用新的做T次数
+9. 每只票当日做T次数见今日计划该标的一行；上限>0且已用完才算次数用尽（上限0不是已满），用尽后的限制见置顶硬约束
+10. 同一分钟只能选一个方向。是否买卖、买多少由你根据当前数据判断；未接回和卖出均价是参考数据
 11. confidence < 0.6 的决策会被风控拒绝
 12. 风控状态为限制交易时只能卖出不能买入
 
 ## 输出格式（严格JSON）
-shares 为本次股数：买入必须100股整数倍且不超过最多可买；卖出必须100股整数倍，或等于全部可卖。本次不必等于可卖全部或未接回全部。示例中的100只是字段占位，不是默认手数。
+shares 为本次股数：买入必须100股整数倍且不超过最多可买；卖出必须100股整数倍，或等于全部可卖。本次不必等于可卖全部；可以超过未接回。示例中的100只是字段占位，不是默认手数。
 ```json
 {{
-  "thought_process": "分析思路",
+  "thought_process": "先对照今日先前结论与已成交，再结合本分钟数据",
+  "minute_conclusion": "一句话：本分钟动作与关键理由",
   "decisions": [
     {{
       "action": "BUY|SELL|HOLD",
@@ -825,6 +925,8 @@ shares 为本次股数：买入必须100股整数倍且不超过最多可买；�
   ]
 }}
 ```
+
+thought_process 先对照今日先前结论与已成交，再写本分钟判断。minute_conclusion 用一句话记下本分钟结论（动作+要点），供下一分钟阅读。不要复读计划全文。先前结论不是必须照做。
 
 如果没有好的机会，所有标的输出HOLD。"""
 

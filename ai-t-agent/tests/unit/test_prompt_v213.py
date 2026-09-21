@@ -134,27 +134,34 @@ OPEN_JIANCANG = (
 
 class TestIntradayLotNote:
     def test_pending_positive(self):
-        assert "未接回100股" in _intraday_lot_note(200, 100)
-        assert "未接回-" not in _intraday_lot_note(200, 100)
+        assert "未接回100股" in _intraday_lot_note(200, 100, 100)
+        assert "未接回-" not in _intraday_lot_note(200, 100, 100)
+        assert "今日已卖200股/已买100股" in _intraday_lot_note(200, 100)
 
     def test_closed_round_trip(self):
         note = _intraday_lot_note(200, 200)
-        assert "接回已闭环" in note
+        assert "今日已卖200股/已买200股" in note
         assert "未接回" not in note
 
     def test_buy_only_not_buyback(self):
         note = _intraday_lot_note(0, 100)
-        assert "今日已买100股（今日无卖出，不是接回）" in note
+        assert "今日已买100股" in note
         assert "未接回" not in note
 
     def test_bought_more_than_sold(self):
         note = _intraday_lot_note(200, 300)
-        assert "接回已闭环" in note
-        assert "净买入100股" in note
+        assert "今日已卖200股/已买300股" in note
         assert "未接回" not in note
 
     def test_no_fills(self):
         assert _intraday_lot_note(0, 0) == ""
+        assert _intraday_lot_note(0, 0, 300) == ", 未接回300股"
+        note = _intraday_lot_note(0, 100, 200)
+        assert "未接回200股" in note
+        assert "今日已买100股" in note
+        bought = _intraday_lot_note(0, 300, 0, 300)
+        assert "今日已买300股" in bought
+        assert "未接回" not in bought
 
 
 class TestBuyUnavailableReason:
@@ -207,25 +214,27 @@ class TestDecisionPromptV214:
         assert "较今开" in prompt
         assert "自日内最低回升" in prompt
         assert "现金不足或已达仓位上限" not in prompt
-        assert "接回（买入今日已卖出但尚未买回的股份）不是加仓" in prompt
+        assert "未接回不是买入上限" in prompt
         assert "先卖后买必须跨分钟顺序执行" not in prompt
         assert "可以跨分钟分批买卖" in prompt
         assert "买入按卖一成交" in prompt
         assert "买一" in prompt and "卖一" in prompt
         assert "购买力" in prompt and "已扣现金预留" in prompt
         assert "停止下单" in prompt
-        assert "禁止加仓BUY" in prompt
-        assert "不等于禁止接回" in prompt
+        assert "最多可买" in prompt
+        assert "不等于禁止买入" in prompt
         assert "示例中的100只是字段占位" in prompt
         assert "振幅" in prompt
         assert "今开较昨收" in prompt
         assert "往返费用约" in prompt
-        assert "元/股打平" in prompt
+        assert "元/股）" in prompt
+        assert "元/股打平" not in prompt
 
     def test_overweight_cap_reason(self):
         prompt = _engine()._build_prompt(
             _snap(), {"002185": _quote()}, RiskState.NORMAL)
-        assert "单票上限剩余不足100股" in prompt
+        assert "单票上限剩余不足100股" not in prompt
+        assert "最多可买" in prompt
         assert "现金不足或已达仓位上限" not in prompt
 
     def test_partial_sell_allows_buyback_next_minute(self):
@@ -269,10 +278,10 @@ class TestDecisionPromptV214:
             RiskState.NORMAL,
         )
         assert "未接回200股" in prompt
-        assert "今日卖出均价17.21" in prompt
+        assert "今日卖出均价17.21" in prompt or "卖出均价17.21" in prompt
         assert "较今日卖出均价" in prompt or "较卖出均价" in prompt
-        assert "买入是接回该笔做T，不是建仓" in prompt
-        assert "接回买入（未接回200股）或观望；不是建仓" in prompt
+        assert "买入是接回该笔做T，不是建仓" not in prompt
+        assert "可买或观望" in prompt
         assert "仅可执行计划中的买入建仓部分" not in prompt
         assert "如需重新参与请先BUY建仓" not in prompt
         assert "买入建仓或观望（无持仓）" not in prompt
@@ -285,8 +294,7 @@ class TestDecisionPromptV214:
         role = hold + hard + plan + quotes
         for kw in OPEN_JIANCANG:
             assert kw not in role
-        assert "无持仓，无股可卖" not in hard
-        assert "禁止发出SELL（无持仓，无股可卖）" not in quotes
+        assert "无持仓，无股可卖，禁止发出SELL" in hard
         assert "仓位比例相对目标" in prompt
         assert "不是减仓或卖出的硬指令" in prompt
 
@@ -296,7 +304,8 @@ class TestDecisionPromptV214:
             {"002185": _quote()},
             RiskState.NORMAL,
         )
-        assert "仅可执行计划中的买入建仓部分" in prompt
+        assert "无持仓，无股可卖，禁止发出SELL" in prompt
+        assert "仅可执行计划中的买入建仓部分" not in prompt
         assert "买入建仓或观望（无持仓）" in prompt
         assert "未接回200股" not in prompt
         assert "002185 今日已卖" not in prompt
@@ -318,8 +327,9 @@ class TestRoleKeywordMatrix:
         assert "买入建仓或观望（无持仓）" not in plan
         assert "仓位比例相对目标" in prompt
         assert "不是减仓或卖出的硬指令" in prompt
-        assert "单票上限剩余不足100股，禁止加仓BUY" in hard
-        assert "不等于禁止接回" in prompt
+        assert "最多可买" in hard
+        assert "单票上限剩余不足100股，禁止加仓BUY" not in hard
+        assert "不等于禁止买入" in prompt
 
     def test_partial_sell_can_buyback_or_sell(self):
         engine = _engine()
@@ -358,7 +368,7 @@ class TestRoleKeywordMatrix:
         hard = _sec(prompt, "硬性约束")
         assert "禁止发出SELL（T+1锁定）" in prompt
         assert "HOLD（T+1不可卖）" in plan
-        assert "接回已闭环" in hold
+        assert "今日已卖200股/已买200股" in hold
         assert "未接回" not in hold
         assert "买入建仓或观望（无持仓）" not in plan
         assert "买入是接回该笔做T，不是建仓" not in hard
@@ -378,9 +388,13 @@ class TestRoleKeywordMatrix:
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
         hold = _sec(prompt, "持仓")
-        assert "仅允许接回BUY" in hard
-        assert "禁止发出SELL和新建仓BUY" in hard
-        assert "接回买入（未接回200股）" in plan
+        assert "仍可BUY" in hard
+        assert "禁止发出SELL" in hard
+        assert "禁止发出SELL和新建仓BUY" not in hard
+        assert "完成本次做T" not in hard
+        assert "仅允许接回BUY" not in hard
+        assert "可买或观望" in plan
+        assert "接回买入（未接回200股）" not in plan
         assert "买入建仓部分" not in hard
         assert "买入建仓或观望（无持仓）" not in plan
         assert "## 持仓\n无持仓" not in prompt
@@ -401,11 +415,11 @@ class TestRoleKeywordMatrix:
         hold = _sec(prompt, "持仓")
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
-        assert "今日已买100股（今日无卖出，不是接回）" in hold
+        assert "今日已买100股" in hold
         assert "未接回" not in hold
         assert "接回已闭环" not in hold
         assert "买入是接回该笔做T，不是建仓" not in hard
-        assert "无未接回时买入不是接回" in prompt
+        assert "未接回不是买入上限" in prompt
         assert "买入建仓或观望（无持仓）" not in plan
 
     def test_bought_over_sold_is_closed_not_negative_pending(self):
@@ -422,8 +436,7 @@ class TestRoleKeywordMatrix:
             RiskState.NORMAL,
         )
         hold = _sec(prompt, "持仓")
-        assert "接回已闭环" in hold
-        assert "净买入100股" in hold
+        assert "今日已卖200股/已买300股" in hold
         assert "未接回" not in hold
 
     def test_true_empty_jiancang_not_buyback(self):
@@ -436,7 +449,8 @@ class TestRoleKeywordMatrix:
         hard = _sec(prompt, "硬性约束")
         plan = _sec(prompt, "今日计划")
         assert hold.strip() == "## 持仓\n无持仓"
-        assert "仅可执行计划中的买入建仓部分" in hard
+        assert "无持仓，无股可卖，禁止发出SELL" in hard
+        assert "仅可执行计划中的买入建仓部分" not in hard
         assert "买入建仓或观望（无持仓）" in plan
         assert "今日卖出均价" not in hold
         assert "未接回200股" not in prompt
@@ -472,15 +486,17 @@ class TestPlannerPromptV13:
         assert "回调至支撑/MA20附近时买入" not in p
         assert "不指定必须使用均线" in p
         assert "不要写「卖在偏高一侧」" in p
-        assert "卖出后的买入写「接回」不要写「建仓」" in p
+        assert "买入可以是接回、加仓或建仓" in p
         assert "卖在当日偏高一侧" not in p
         assert "接回低于卖出价" not in p
-        assert "卖出后的接回" in p
         assert "不要写死持仓/可卖/未接回的全部股数" in p
         assert "禁止「卖出300股」" in p
-        assert "接回同等股数" in p
+        assert "未接回不是买入上限" in p
         assert "每笔卖出占1次" in p
         assert "不要因此要求一次卖光或必须分批" in p
+        assert "不要把 max_trades_hint 写成 0" in p
+        assert "0 不等于次数已满" in p
+        assert "空仓时不要全日禁止买入" in p
         assert "若已达目标仓位，计划中不得再包含买入动作" not in p
         assert plan.last_at_plan.get("002185") == q.last
         assert plan.generated_at

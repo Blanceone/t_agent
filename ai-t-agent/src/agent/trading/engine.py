@@ -108,6 +108,7 @@ class TradingEngine:
         # 记账
         self._apply_fill(fill, intent)
         self.today_fills.append(fill)
+        self._update_pending(fill, intent)
 
         logger.info(
             "order_filled",
@@ -190,6 +191,14 @@ class TradingEngine:
             del self.account.positions[code]
             logger.info("position_closed", code=code, reason="DECISION_SELL")
 
+    def _update_pending(self, fill: Fill, intent: OrderIntent) -> None:
+        """决策成交维护未接回；强平/止损/移出池的卖出不作为做T接回。"""
+        if intent.source == OrderSource.DECISION:
+            self.account.apply_fill_to_pending(fill)
+            return
+        if fill.action == ActionType.SELL:
+            self.account.clear_pending(fill.code)
+
     def enqueue_liquidation(self, code: str, exit_reason: str) -> None:
         """加入清仓队列"""
         pos = self.account.positions.get(code)
@@ -230,6 +239,7 @@ class TradingEngine:
             )
             self._apply_sell(fill.code, fill, intent)
             self.today_fills.append(fill)
+            self._update_pending(fill, intent)
             logger.info(
                 "order_filled",
                 code=fill.code,
